@@ -3,11 +3,9 @@ import io
 from typing import Tuple, List, Dict
 
 import streamlit as st
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 import numpy as np
-import cv2
 import pytesseract
-
 from groq import Groq
 
 
@@ -21,9 +19,7 @@ st.set_page_config(
 )
 
 st.title("🔎 OCR → 💬 LLM Explainer (Groq)")
-st.write(
-    "Sube una imagen con texto. El sistema hará OCR (Tesseract) y un LLM de Groq explicará el contenido."
-)
+st.write("Sube una imagen con texto. Se hará OCR (Tesseract) y un LLM de Groq explicará el contenido.")
 
 
 # ----------------------------
@@ -41,16 +37,16 @@ with st.sidebar:
     if api_key_input:
         os.environ["GROQ_API_KEY"] = api_key_input
 
-    # Model selector (safe defaults that exist on Groq)
+    # Model selector
     model_name = st.selectbox(
         "Groq model",
         options=[
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
-            "llama3-8b-8192",   # legacy but often still available
+            "llama3-8b-8192",
         ],
         index=0,
-        help="Modelos Groq recomendados para buen balance entre calidad y latencia."
+        help="Modelos Groq con buen balance calidad/latencia."
     )
 
     # OCR language
@@ -63,65 +59,105 @@ with st.sidebar:
 
     # Preprocessing
     do_denoise = st.checkbox("Denoise (mediana)", value=True)
-    do_threshold = st.checkbox("Adaptive threshold", value=True)
+    do_threshold = st.checkbox("Threshold (global)", value=True)
+    threshold_method = st.selectbox("Método de umbral", ["mean", "percentile_80"], index=0)
 
     # LLM output language
-    explain_lang = st.selectbox(
-        "Explicación en:",
-        options=["auto", "es", "en", "pt"],
-        index=0
+    explain_lang = st.selectbox("Explicación en:", ["auto", "es", "en", "pt"], index=0)
+
+    # (Opcional) Ruta Tesseract en Windows
+    tesseract_cmd = st.text_input(
+        "Ruta Tesseract (solo si Windows no lo detecta)",
+        help=r"Ej.: C:\Program Files\Tesseract-OCR\tesseract.exe"
     )
+    if tesseract_cmd.strip():
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd.strip()
 
 
 # ----------------------------
-# OCR Pipeline
+# OCR Pipeline (sin OpenCV)
 # ----------------------------
+def _global_threshold(arr: np.ndarray, method: str = "mean") -> np.ndarray:
+    """Binariza una imagen en escala de grises con un umbral global sencillo."""
+    if method == "percentile_80":
+        thr = np.percentile(arr, 80)
+    else:
+        thr = arr.mean()
+    return (arr > thr).astype(np.uint8) * 255
+
+
 def preprocess_for_ocr(pil_img: Image.Image,
                        denoise: bool = True,
-                       threshold: bool = True) -> np.ndarray:
-    """Return OpenCV BGR image optimized for OCR."""
-    img = np.array(pil_img.convert("RGB"))
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                       threshold: bool = True,
+                       method: str = "mean") -> Image.Image:
+    """
+    Preprocesa la imagen para OCR usando únicamente Pillow+NumPy:
+    - Convierte a escala de grises
+    - Filtro mediana opcional
+    - Umbral global sencillo (mean o percentile_80)
+    - Autocontraste ligero
+    Devuelve una PIL.Image en modo 'L' o '1' (binarizada).
+    """
+    # 1) Grayscale
+    gray = pil_img.convert("L")
+
+    # 2) Denoise (mediana)
     if denoise:
-        gray = cv2.medianBlur(gray, 3)
+        gray = gray.filter(ImageFilter.MedianFilter(size=3))
+
+    # 3) Threshold global
     if threshold:
-        gray = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 25, 15
-        )
+        arr = np.array(gray)
+        bin_arr = _global_threshold(arr, method=method)
+        gray = Image.fromarray(bin_arr)
+
+    # 4) Autocontraste ligero para mejorar OCR
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+
     return gray
 
 
 def run_tesseract_ocr(pil_img: Image.Image, lang: str = "spa") -> Tuple[str, List[Dict]]:
     """
     Returns: (full_text, boxes)
-    - full_text: concatenated extracted text
-    - boxes: list of dicts with bbox + word + conf
+    - full_text: texto extraído
+    - boxes: lista con dicts {text, conf, bbox}
     """
-    pre = preprocess_for_ocr(pil_img, denoise=do_denoise, threshold=do_threshold)
+    pre = preprocess_for_ocr(
+        pil_img,
+        denoise=do_denoise,
+        threshold=do_threshold,
+        method=threshold_method
+    )
 
-    # text
+    # Config Tesseract (modo estándar para texto con múltiples líneas)
     cfg = "--oem 3 --psm 6"
+
+    # Texto
     text = pytesseract.image_to_string(pre, lang=lang, config=cfg)
 
-    # boxes (word-level)
+    # Boxes palabra a palabra
     data = pytesseract.image_to_data(pre, lang=lang, config=cfg, output_type=pytesseract.Output.DICT)
-
     boxes = []
     for i in range(len(data["text"])):
-        if int(data["conf"][i]) > 0:
-            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        try:
+            conf_i = float(data["conf"][i])
+        except ValueError:
+            conf_i = -1.0
+        if conf_i > 0:
+            x, y = data["left"][i], data["top"][i]
+            w, h = data["width"][i], data["height"][i]
             boxes.append({
                 "text": data["text"][i],
-                "conf": float(data["conf"][i]),
+                "conf": conf_i,
                 "bbox": (x, y, x + w, y + h)
             })
 
-    return text.strip(), boxes
+    return (text or "").strip(), boxes
 
 
 def draw_bboxes(original: Image.Image, boxes: List[Dict]) -> Image.Image:
-    """Draw green boxes around detected words."""
+    """Dibuja cajas verdes alrededor de palabras detectadas."""
     img = original.convert("RGB").copy()
     draw = ImageDraw.Draw(img)
     for b in boxes:
@@ -130,13 +166,13 @@ def draw_bboxes(original: Image.Image, boxes: List[Dict]) -> Image.Image:
 
 
 # ----------------------------
-# LLM (Groq) Call
+# LLM (Groq)
 # ----------------------------
 def explain_with_groq(extracted_text: str,
                       model: str = "llama-3.3-70b-versatile",
                       lang: str = "auto") -> str:
     """
-    Ask a Groq LLM to explain the extracted text clearly.
+    Pide a Groq LLM que explique el texto OCR.
     """
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
     lang_instr = {
@@ -148,7 +184,7 @@ def explain_with_groq(extracted_text: str,
 
     system_msg = (
         "Eres un asistente que explica texto detectado por OCR. "
-        "Da contexto, propósito probable, público objetivo, tono, y acciones recomendadas. "
+        "Da contexto, propósito probable, público objetivo, tono y acciones recomendadas. "
         "Si el texto está incompleto, señala lagunas. Sé claro y conciso."
     )
 
@@ -185,17 +221,14 @@ Entrega tu respuesta con esta estructura:
 # ----------------------------
 # MAIN APP
 # ----------------------------
-uploaded = st.file_uploader(
-    "Sube una imagen (PNG/JPG/JPEG)",
-    type=["png", "jpg", "jpeg"]
-)
+uploaded = st.file_uploader("Sube una imagen (PNG/JPG/JPEG)", type=["png", "jpg", "jpeg"])
 
 if uploaded is not None:
     try:
         pil_img = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
         st.image(pil_img, caption="Imagen cargada", use_column_width=True)
 
-        with st.spinner("Ejecutando OCR..."):
+        with st.spinner("Ejecutando OCR…"):
             text, boxes = run_tesseract_ocr(pil_img, lang=ocr_lang)
 
         col1, col2 = st.columns(2)
@@ -217,7 +250,6 @@ if uploaded is not None:
             st.subheader("💬 Explicación del LLM")
             st.write(explanation)
 
-            # Download JSON-ish (simple)
             st.download_button(
                 "⬇️ Descargar resultado (txt)",
                 data=f"=== OCR TEXT ===\n{text}\n\n=== LLM EXPLANATION ===\n{explanation}",
