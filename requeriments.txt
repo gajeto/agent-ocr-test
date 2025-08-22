@@ -1,6 +1,7 @@
-streamlit>=1.35
-pillow>=10.3
-numpy>=1.26
-pytesseract>=0.3.10
-groq>=0.10.0
-python-dotenv>=1.0.1
+streamlit
+groq
+easyocr
+pillow
+numpy
+pytesseract
+python-dotenv
